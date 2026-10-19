@@ -6,10 +6,14 @@ M5 销量预测复现（对照实验）
 
   1. LightGBM      —— 交叉特征 + 滞后特征（表格型基线）
   2. Transformer   —— 纯编码器 + 可学习位置编码 + 序列归一化损失（RMSSE 风格）
+  3. PatchTST      —— 纯销量序列分块编码（patchTS.py 原模型）
+  4. iTransformer  —— 变量维度注意力（itranformer.py 原模型）
 
 数据管线沿用仓库中 patchTS.py / itranformer.py 的 50 商品抽样方案，
 但按 md 描述改为：输入窗口 56 天、预测 28 天、滑窗步长 7，
 销量做 log1p 变换，引入日历 / SNAP / 价格 / 促销（事件）等特征。
+PatchTST / iTransformer 为纯销量序列模型（回看 112 天），
+并以「预测起始日」为原点对齐到与上方模型相同的目标区间，便于公平对比。
 
 说明：md 原文针对 item-store 级 30490 条序列；此处为可直接运行，
 改为 50 个商品（跨门店聚合）的抽样，方法学保持一致。
@@ -68,6 +72,15 @@ OUT_DIR = BASE_DIR / "outputs"
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+# PatchTST / iTransformer 超参（取自各自原脚本，保持可比；与上方 Transformer 互不干扰）
+HISTORY2 = 112        # 两模型回看历史（原脚本 HISTORY=112）
+PATCH_LEN = 16        # 必须定义：PatchTSTEncoder 默认参数在类定义时求值
+PATCH_STRIDE = 8
+PT_D_MODEL = 64
+PT_N_HEADS = 4
+PT_LAYERS = 2
+PT_DROPOUT = 0.1
 
 
 def seed_everything(seed=SEED):
@@ -826,6 +839,212 @@ def plot_compare(dates, y_true, preds, item_ids):
 
 
 # ============================================================
+# 10b. PatchTST / iTransformer 对比模型
+# ============================================================
+# 这两个模型来自仓库的 patchTS.py / itranformer.py，直接对「商品级销量序列」
+# 建模（不引入外部特征）。为与上方 Transformer/LightGBM 公平对比，这里统一
+# 在 data["sales"]（同一批 50 商品、跨门店聚合）上训练，并以「预测起始日」为
+# 原点对齐到相同的 28 天目标区间。
+
+def fit_log_scaler(train_raw):
+    # 对非负销量先 log1p，再按商品标准化（仅用训练期）
+    logged = np.log1p(np.maximum(train_raw, 0))
+    mean = logged.mean(axis=0, keepdims=True).astype(np.float32)
+    std = logged.std(axis=0, keepdims=True).astype(np.float32)
+    std[std < 1e-5] = 1.0
+    return mean, std
+
+
+def log_transform(raw, mean, std):
+    return ((np.log1p(np.maximum(raw, 0)) - mean) / std).astype(np.float32)
+
+
+def log_inverse(x, mean, std):
+    return np.maximum(np.expm1(x * std + mean), 0)
+
+
+class SalesSeriesDataset(Dataset):
+    """纯销量序列窗口：x=[history, N]，y=[horizon, N]。"""
+    def __init__(self, values, origins, history, horizon):
+        self.values = values
+        self.origins = origins
+        self.history = history
+        self.horizon = horizon
+
+    def __len__(self):
+        return len(self.origins)
+
+    def __getitem__(self, idx):
+        o = self.origins[idx]
+        x = self.values[o - self.history:o]
+        y = self.values[o:o + self.horizon]
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32),
+        )
+
+
+class PatchTSTEncoder(nn.Module):
+    """输入 [B,T,N]，每个商品独立切 Patch，共享时间编码参数，输出 [B,N,D]。"""
+    def __init__(self, history=HISTORY2, d_model=PT_D_MODEL, n_heads=PT_N_HEADS,
+                 patch_len=PATCH_LEN, stride=PATCH_STRIDE, dropout=PT_DROPOUT,
+                 layers=PT_LAYERS):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        n_patches = (history - patch_len) // stride + 1
+        self.patch_embed = nn.Linear(patch_len, d_model)
+        self.pos_embed = nn.Parameter(torch.randn(1, n_patches, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+        x = (x - mean) / std
+        x = x.transpose(1, 2)                       # [B,N,T]
+        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        b, n, p, length = patches.shape
+        tokens = patches.reshape(b * n, p, length)
+        tokens = self.patch_embed(tokens)
+        tokens = tokens + self.pos_embed[:, :p, :]
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens)
+        item_repr = tokens.mean(dim=1).reshape(b, n, -1)
+        return item_repr
+
+
+class PatchTSTBaseline(nn.Module):
+    def __init__(self, history=HISTORY2, horizon=PRED_LEN, **kwargs):
+        super().__init__()
+        d_model = kwargs.get("d_model", PT_D_MODEL)
+        dropout = kwargs.get("dropout", PT_DROPOUT)
+        self.temporal = PatchTSTEncoder(
+            history=history, d_model=d_model,
+            n_heads=kwargs.get("n_heads", PT_N_HEADS),
+            patch_len=kwargs.get("patch_len", PATCH_LEN),
+            stride=kwargs.get("stride", PATCH_STRIDE),
+            dropout=dropout, layers=kwargs.get("layers", PT_LAYERS),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model, horizon),
+        )
+
+    def forward(self, x):
+        h = self.temporal(x)
+        return self.head(h).transpose(1, 2)        # [B,H,N]
+
+
+class iTransformer(nn.Module):
+    """Inverted Transformer：在变量（商品）维度做注意力。输入输出均为 [B,T,N]。"""
+    def __init__(self, history=HISTORY2, horizon=PRED_LEN, n_vars=None,
+                 d_model=PT_D_MODEL, n_heads=PT_N_HEADS,
+                 dropout=PT_DROPOUT, layers=PT_LAYERS):
+        super().__init__()
+        self.value_embed = nn.Linear(history, d_model)
+        if n_vars is not None:
+            self.var_pos_embed = nn.Parameter(torch.zeros(1, n_vars, d_model))
+        else:
+            self.var_pos_embed = None
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model, horizon),
+        )
+
+    def forward(self, x):
+        x = x.transpose(1, 2)                       # [B,N,T]
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-4)
+        x = (x - mean) / std
+        tokens = self.value_embed(x)               # [B,N,D]
+        if self.var_pos_embed is not None:
+            tokens = tokens + self.var_pos_embed
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens)
+        y = self.head(tokens)                      # [B,N,H]
+        return y.transpose(1, 2)                   # [B,H,N]
+
+
+def train_patch_model(model, train_loader, val_loader, mean, std, model_name):
+    model = model.to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.MSELoss()
+    best_val = float("inf")
+    best_state = None
+    bad_epochs = 0
+    logs = []
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        losses = []
+        for x, y in train_loader:
+            x = x.to(DEVICE)
+            y = y.to(DEVICE)
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(x)
+            loss = criterion(pred, y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            losses.append(loss.item())
+        # 验证（反归一化后比较 MAE，与 patchTS/itranformer 原脚本一致）
+        model.eval()
+        vs, vp = [], []
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(DEVICE)
+                vs.append(y.numpy())
+                vp.append(model(x).cpu().numpy())
+        yt = log_inverse(np.concatenate(vs), mean, std)
+        yp = log_inverse(np.concatenate(vp), mean, std)
+        val_mae = float(np.mean(np.abs(yt - yp)))
+        logs.append({
+            "epoch": epoch,
+            "train_mse": float(np.mean(losses)),
+            "val_mae": val_mae,
+        })
+        print(f"{model_name} | Epoch {epoch:02d}/{EPOCHS} | "
+              f"Train MSE={np.mean(losses):.5f} | Val MAE={val_mae:.4f}")
+        if val_mae < best_val:
+            best_val = val_mae
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+        if bad_epochs >= PATIENCE:
+            print("Early stopping.")
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    pd.DataFrame(logs).to_csv(OUT_DIR / f"training_{model_name}.csv", index=False)
+    return model
+
+
+@torch.no_grad()
+def eval_patch_model(model, loader, mean, std):
+    model.eval()
+    ys, ps = [], []
+    for x, y in loader:
+        x = x.to(DEVICE)
+        ys.append(y.numpy())
+        ps.append(model(x).cpu().numpy())
+    yt = log_inverse(np.concatenate(ys), mean, std)
+    yp = log_inverse(np.concatenate(ps), mean, std)
+    return yt, yp                               # 均为 [n_windows, H, N]
+
+
+# ============================================================
 # 11. 主流程
 # ============================================================
 
@@ -903,8 +1122,88 @@ def main():
 
     bst.save_model(str(OUT_DIR / "LightGBM.txt"))
 
+    # ---------- PatchTST / iTransformer（纯销量序列，与现有模型同目标区间对比） ----------
+    # 现有 Transformer 的目标区间是 [s+SEQ_LEN, s+SEQ_LEN+PRED_LEN)；
+    # 让新模型以 p = s+SEQ_LEN 为「预测起始日」原点（预测 [p, p+PRED_LEN)），
+    # 即把新模型的滑窗起点对齐到同一批目标区间，保证指标与绘图可比。
+    final_origin = int(test_o[-1])
+    pstarts_train = train_o + SEQ_LEN
+    pstarts_val = val_o + SEQ_LEN
+    pstarts_test = test_o + SEQ_LEN
+    pstarts_train = pstarts_train[pstarts_train >= HISTORY2]
+    pstarts_val = pstarts_val[pstarts_val >= HISTORY2]
+    pstarts_test = pstarts_test[pstarts_test >= HISTORY2]
+
+    raw = data["sales"].astype(np.float32)              # (n_days, n_items)
+    T_train = int(n_days * 0.70)
+    mean, std = fit_log_scaler(raw[:T_train])
+    values = log_transform(raw, mean, std)              # (n_days, n_items)
+
+    # RMSSE 分母（与现有指标口径一致：各商品训练期一阶差分 RMS）
+    denom = np.mean(np.diff(raw[:T_train], axis=0) ** 2, axis=0)
+    item_scale = np.sqrt(np.maximum(denom, 1e-8)).astype(np.float32)
+    scale_floor = max(float(np.percentile(item_scale, 5)), 1e-2)
+    item_scale = np.maximum(item_scale, scale_floor)
+
+    patch_models = {
+        "PatchTST": PatchTSTBaseline(
+            history=HISTORY2, horizon=PRED_LEN,
+            d_model=PT_D_MODEL, n_heads=PT_N_HEADS, layers=PT_LAYERS,
+            patch_len=PATCH_LEN, stride=PATCH_STRIDE, dropout=PT_DROPOUT,
+        ),
+        "iTransformer": iTransformer(
+            history=HISTORY2, horizon=PRED_LEN, n_vars=n_items,
+            d_model=PT_D_MODEL, n_heads=PT_N_HEADS, layers=PT_LAYERS,
+            dropout=PT_DROPOUT,
+        ),
+    }
+
+    all_metrics = [transformer_metrics, lightgbm_metrics]
+    patch_preds = {}
+    final_origin_plot = final_origin + SEQ_LEN        # 对齐 test_dates 起点
+
+    for name, m in patch_models.items():
+        print("\n训练:", name)
+        dl_tr = DataLoader(
+            SalesSeriesDataset(values, pstarts_train, HISTORY2, PRED_LEN),
+            batch_size=BATCH_SIZE, shuffle=True,
+        )
+        dl_va = DataLoader(
+            SalesSeriesDataset(values, pstarts_val, HISTORY2, PRED_LEN),
+            batch_size=1, shuffle=False,
+        )
+        dl_te = DataLoader(
+            SalesSeriesDataset(values, pstarts_test, HISTORY2, PRED_LEN),
+            batch_size=1, shuffle=False,
+        )
+        dl_fin = DataLoader(
+            SalesSeriesDataset(values, np.array([final_origin_plot]), HISTORY2, PRED_LEN),
+            batch_size=1, shuffle=False,
+        )
+
+        m = train_patch_model(m, dl_tr, dl_va, mean, std, name)
+        yt, yp = eval_patch_model(m, dl_te, mean, std)
+        # yt/yp 形状 (n_test, H, N)；每个 (window, item) 视为一个长度为 H 的序列样本
+        B = yt.shape[0] * yt.shape[2]
+        yt_f = yt.reshape(B, PRED_LEN)
+        yp_f = yp.reshape(B, PRED_LEN)
+        sc_f = np.tile(item_scale, yt.shape[0]).reshape(B, 1)
+        met = compute_metrics(yt_f, yp_f, sc_f)
+        met["model"] = name
+        met["parameters"] = sum(
+            p.numel() for p in m.parameters() if p.requires_grad
+        )
+        all_metrics.append(met)
+        print(name, "Test:", {
+            k: (round(v, 4) if isinstance(v, float) else v) for k, v in met.items()
+        })
+
+        _, yp_last = eval_patch_model(m, dl_fin, mean, std)   # (1, H, N)
+        patch_preds[name] = yp_last
+        torch.save(m.state_dict(), OUT_DIR / (name + ".pt"))
+
     # ---------- 对比 ----------
-    results = pd.DataFrame([transformer_metrics, lightgbm_metrics])[
+    results = pd.DataFrame(all_metrics)[
         ["model", "RMSSE", "MAE", "RMSE", "WAPE"]
     ]
     results.to_csv(OUT_DIR / "metrics.csv", index=False)
@@ -912,7 +1211,6 @@ def main():
     print(results.to_string(index=False))
 
     # ---------- 绘图（取测试集最后一个窗口） ----------
-    final_origin = int(test_o[-1])
     # 重新用单窗口构造 Transformer 预测，对齐 LightGBM 最后一个窗口
     Xf, Ff, itf, yf, sf = build_transformer_data(
         data, np.array([final_origin])
@@ -933,6 +1231,7 @@ def main():
     preds = {
         "Transformer": ptf.T.reshape(1, PRED_LEN, n_items),
         "LightGBM": pl.T.reshape(1, PRED_LEN, n_items),
+        **patch_preds,
     }
     test_dates = pd.date_range(
         start=data["dates"][final_origin + SEQ_LEN],
