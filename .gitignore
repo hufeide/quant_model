@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# build output
+lib/
+*.tsbuildinfo
+
+# npm
+*.tgz
+
+# misc
+.DS_Store
+*.log
+
+m5_hybrid/data
+m5_hybrid/outputs
+m5_hybrid/experiment_runs
