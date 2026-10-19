@@ -12,8 +12,10 @@ M5 销量预测复现（对照实验）
 数据管线沿用仓库中 patchTS.py / itranformer.py 的 50 商品抽样方案，
 但按 md 描述改为：输入窗口 56 天、预测 28 天、滑窗步长 7，
 销量做 log1p 变换，引入日历 / SNAP / 价格 / 促销（事件）等特征。
-PatchTST / iTransformer 为纯销量序列模型（回看 112 天），
-并以「预测起始日」为原点对齐到与上方模型相同的目标区间，便于公平对比。
+PatchTST / iTransformer 现已接入与 Transformer 同套协变量
+（价格归一化 / 日历 wday·month·year / SNAP / 事件 / 价格可用性），
+并以「预测起始日」为原点对齐到与上方模型相同的目标区间，形成更公平的对照。
+输入上下文 = 历史 112 天 + 未来 28 天：未来段销量置 0（屏蔽目标），但协变量可见。
 
 说明：md 原文针对 item-store 级 30490 条序列；此处为可直接运行，
 改为 50 个商品（跨门店聚合）的抽样，方法学保持一致。
@@ -75,6 +77,7 @@ DEVICE = torch.device(
 
 # PatchTST / iTransformer 超参（取自各自原脚本，保持可比；与上方 Transformer 互不干扰）
 HISTORY2 = 112        # 两模型回看历史（原脚本 HISTORY=112）
+PT_CONTEXT = HISTORY2 + PRED_LEN   # 输入上下文长度：历史 112 + 预测 28（含未来协变量）
 PATCH_LEN = 16        # 必须定义：PatchTSTEncoder 默认参数在类定义时求值
 PATCH_STRIDE = 8
 PT_D_MODEL = 64
@@ -259,6 +262,19 @@ def prepare_data():
     price_avail_mat = wide_price_avail.to_numpy(dtype=np.float32)
     snap_mat = wide_snap.to_numpy(dtype=np.float32)
 
+    # 价格归一化（与 build_transformer_data 口径一致）：仅用训练期有价格的日子
+    # 估计均值/标准差，缺失价格日置 0，避免测试期出现 NaN 污染。
+    hist_cut = int(sales_mat.shape[0] * 0.70)
+    pmask = price_avail_mat[:hist_cut] > 0
+    ptrain = np.where(pmask, price_mat[:hist_cut], np.nan)
+    pmean = np.nanmean(ptrain, axis=0)
+    pstd = np.nanstd(ptrain, axis=0)
+    pmean = np.where(np.isnan(pmean), 0.0, pmean)
+    pstd = np.where(np.isnan(pstd) | (pstd < 1e-5), 1.0, pstd)
+    price_norm_mat = (price_mat - pmean[None, :]) / pstd[None, :]
+    price_norm_mat = np.where(price_avail_mat > 0, price_norm_mat, 0.0)
+    price_norm_mat = np.nan_to_num(price_norm_mat, nan=0.0).astype(np.float32)
+
     # 关键修正：用「销量真实日期」对齐日历，保证 cal_feat 与 sales_mat 逐行一致
     cal_by_date = calendar.set_index("date")
     cal_aligned = cal_by_date.reindex(wide_sales.index)
@@ -295,6 +311,7 @@ def prepare_data():
         "chosen": chosen,
         "sales": sales_mat,
         "price": price_mat,
+        "price_norm": price_norm_mat,   # (n_days, n_items) 训练期归一化价格
         "price_avail": price_avail_mat,
         "snap": snap_mat,
         "cal_feat": cal_df,         # (n_days, 4): wday, month, year, event_flag
@@ -884,16 +901,50 @@ class SalesSeriesDataset(Dataset):
         )
 
 
+class CovariateSeriesDataset(Dataset):
+    """销量 + 协变量序列窗口，供 PatchTST / iTransformer 使用。
+    返回 x=[win, N, D]（win = history + horizon）：
+      - 通道 0：逐日销量（已 log1p 标准化），未来段（最后 horizon 天）置 0 以屏蔽目标；
+      - 通道 1..：协变量（价格/日历/SNAP/事件/价格可用性），历史与未来段均提供（不泄漏销量）。
+    y=[horizon, N]：未来 horizon 天销量（标准化空间，与 patchTS/itranformer 一致）。
+    """
+    def __init__(self, sales, cov, origins, history, horizon):
+        self.sales = sales            # [n_days, n_items]（标准化后销量）
+        self.cov = cov                # [n_days, n_items, D_cov]
+        self.origins = origins
+        self.history = history
+        self.horizon = horizon
+        self.win = history + horizon
+
+    def __len__(self):
+        return len(self.origins)
+
+    def __getitem__(self, idx):
+        o = self.origins[idx]
+        ctx_sales = self.sales[o - self.history:o + self.horizon]   # [win, N]
+        ctx_cov = self.cov[o - self.history:o + self.horizon]       # [win, N, D_cov]
+        x = np.concatenate([ctx_sales[..., None], ctx_cov], axis=-1)  # [win, N, D]
+        x[self.history:, :, 0] = 0.0    # 屏蔽未来销量，仅保留协变量可见
+        y = self.sales[o:o + self.horizon]                           # [horizon, N]
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32),
+        )
+
+
 class PatchTSTEncoder(nn.Module):
-    """输入 [B,T,N]，每个商品独立切 Patch，共享时间编码参数，输出 [B,N,D]。"""
+    """输入 [B,T,N,D]：每个商品 n 在时刻 t 的特征向量 [销量, +协变量]。
+    仅对销量通道做实例归一化（用历史段，与原始 PatchTST 行为一致），协变量原样拼接，
+    再沿时间维切 Patch，输出 [B,N,D_model]。"""
     def __init__(self, history=HISTORY2, d_model=PT_D_MODEL, n_heads=PT_N_HEADS,
                  patch_len=PATCH_LEN, stride=PATCH_STRIDE, dropout=PT_DROPOUT,
-                 layers=PT_LAYERS):
+                 layers=PT_LAYERS, d_input=1, hist_len=None):
         super().__init__()
         self.patch_len = patch_len
         self.stride = stride
+        self.hist_len = hist_len if hist_len is not None else history
         n_patches = (history - patch_len) // stride + 1
-        self.patch_embed = nn.Linear(patch_len, d_model)
+        self.patch_embed = nn.Linear(patch_len * d_input, d_model)
         self.pos_embed = nn.Parameter(torch.randn(1, n_patches, d_model) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
@@ -903,13 +954,20 @@ class PatchTSTEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        mean = x.mean(dim=1, keepdim=True)
-        std = x.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
-        x = (x - mean) / std
-        x = x.transpose(1, 2)                       # [B,N,T]
-        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        b, n, p, length = patches.shape
-        tokens = patches.reshape(b * n, p, length)
+        # x: [B, T, N, D]，通道 0 为销量，1: 为协变量
+        B, T, N, D = x.shape
+        sales = x[..., 0:1]                         # [B, T, N, 1]
+        cov = x[..., 1:]                            # [B, T, N, D-1]
+        # 仅用历史段对销量做实例归一化（与原始 PatchTST 行为一致）
+        hist_sales = sales[:, :self.hist_len]
+        mean = hist_sales.mean(dim=1, keepdim=True)
+        std = hist_sales.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+        sales_n = (sales - mean) / std
+        x = torch.cat([sales_n, cov], dim=-1)       # [B, T, N, D]
+        x = x.transpose(1, 2)                       # [B, N, T, D]
+        patches = x.unfold(dimension=-2, size=self.patch_len, step=self.stride)
+        b, n, p, length, d = patches.shape
+        tokens = patches.reshape(b * n, p, length * d)
         tokens = self.patch_embed(tokens)
         tokens = tokens + self.pos_embed[:, :p, :]
         tokens = self.encoder(tokens)
@@ -919,7 +977,8 @@ class PatchTSTEncoder(nn.Module):
 
 
 class PatchTSTBaseline(nn.Module):
-    def __init__(self, history=HISTORY2, horizon=PRED_LEN, **kwargs):
+    def __init__(self, history=HISTORY2, horizon=PRED_LEN, d_input=1,
+                 hist_len=None, **kwargs):
         super().__init__()
         d_model = kwargs.get("d_model", PT_D_MODEL)
         dropout = kwargs.get("dropout", PT_DROPOUT)
@@ -929,6 +988,7 @@ class PatchTSTBaseline(nn.Module):
             patch_len=kwargs.get("patch_len", PATCH_LEN),
             stride=kwargs.get("stride", PATCH_STRIDE),
             dropout=dropout, layers=kwargs.get("layers", PT_LAYERS),
+            d_input=d_input, hist_len=hist_len,
         )
         self.head = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
@@ -941,12 +1001,17 @@ class PatchTSTBaseline(nn.Module):
 
 
 class iTransformer(nn.Module):
-    """Inverted Transformer：在变量（商品）维度做注意力。输入输出均为 [B,T,N]。"""
+    """Inverted Transformer（带协变量）：输入 [B,T,N,D]，通道 0 为销量，1: 为协变量。
+    对每个商品把其 [T,D] 时间序列（销量实例归一化后 + 协变量）压扁为单个 token，
+    在变量（商品）维度做自注意力，输出 [B,H,N]。"""
     def __init__(self, history=HISTORY2, horizon=PRED_LEN, n_vars=None,
                  d_model=PT_D_MODEL, n_heads=PT_N_HEADS,
-                 dropout=PT_DROPOUT, layers=PT_LAYERS):
+                 dropout=PT_DROPOUT, layers=PT_LAYERS,
+                 d_input=1, hist_len=None):
         super().__init__()
-        self.value_embed = nn.Linear(history, d_model)
+        self.d_input = d_input
+        self.hist_len = hist_len if hist_len is not None else history
+        self.value_embed = nn.Linear(history * d_input, d_model)
         if n_vars is not None:
             self.var_pos_embed = nn.Parameter(torch.zeros(1, n_vars, d_model))
         else:
@@ -963,11 +1028,18 @@ class iTransformer(nn.Module):
         )
 
     def forward(self, x):
-        x = x.transpose(1, 2)                       # [B,N,T]
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-4)
-        x = (x - mean) / std
-        tokens = self.value_embed(x)               # [B,N,D]
+        # x: [B, T, N, D]
+        B, T, N, D = x.shape
+        sales = x[..., 0:1]                         # [B, T, N, 1]
+        cov = x[..., 1:]                            # [B, T, N, D-1]
+        # 仅用历史段对销量做实例归一化（与原始 iTransformer 行为一致）
+        hist_sales = sales[:, :self.hist_len]
+        mean = hist_sales.mean(dim=1, keepdim=True)
+        std = hist_sales.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+        sales_n = (sales - mean) / std
+        x = torch.cat([sales_n, cov], dim=-1)       # [B, T, N, D]
+        x = x.permute(0, 2, 1, 3).reshape(B, N, T * D)
+        tokens = self.value_embed(x)               # [B,N,d_model]
         if self.var_pos_embed is not None:
             tokens = tokens + self.var_pos_embed
         tokens = self.encoder(tokens)
@@ -1139,6 +1211,24 @@ def main():
     mean, std = fit_log_scaler(raw[:T_train])
     values = log_transform(raw, mean, std)              # (n_days, n_items)
 
+    # 协变量张量 [n_days, n_items, 7]：价格(归一化) + 日历(wday/month/year)
+    # + SNAP + 事件 + 价格可用性；通道顺序与 Transformer 的 fut_feat 完全一致
+    # （均为已知未来信息，不泄漏销量）。销售通道在模型内单独拼接。
+    cal = data["cal_feat"]                              # (n_days, 4)
+    cal_b = np.broadcast_to(
+        cal[:, None, :], (n_days, n_items, cal.shape[1])
+    ).astype(np.float32)
+    cov = np.stack([
+        data["price_norm"],        # [n_days, n_items]
+        cal_b[..., 0],             # wday
+        cal_b[..., 1],             # month
+        cal_b[..., 2],             # year
+        data["snap"],              # SNAP（按州）
+        cal_b[..., 3],             # event_flag
+        data["price_avail"],       # 价格可用性
+    ], axis=-1).astype(np.float32)
+    D_INPUT = cov.shape[-1] + 1    # 销量通道 + 协变量通道
+
     # RMSSE 分母（与现有指标口径一致：各商品训练期一阶差分 RMS）
     denom = np.mean(np.diff(raw[:T_train], axis=0) ** 2, axis=0)
     item_scale = np.sqrt(np.maximum(denom, 1e-8)).astype(np.float32)
@@ -1147,12 +1237,13 @@ def main():
 
     patch_models = {
         "PatchTST": PatchTSTBaseline(
-            history=HISTORY2, horizon=PRED_LEN,
+            history=PT_CONTEXT, horizon=PRED_LEN, d_input=D_INPUT, hist_len=HISTORY2,
             d_model=PT_D_MODEL, n_heads=PT_N_HEADS, layers=PT_LAYERS,
             patch_len=PATCH_LEN, stride=PATCH_STRIDE, dropout=PT_DROPOUT,
         ),
         "iTransformer": iTransformer(
-            history=HISTORY2, horizon=PRED_LEN, n_vars=n_items,
+            history=PT_CONTEXT, horizon=PRED_LEN, n_vars=n_items,
+            d_input=D_INPUT, hist_len=HISTORY2,
             d_model=PT_D_MODEL, n_heads=PT_N_HEADS, layers=PT_LAYERS,
             dropout=PT_DROPOUT,
         ),
@@ -1165,19 +1256,19 @@ def main():
     for name, m in patch_models.items():
         print("\n训练:", name)
         dl_tr = DataLoader(
-            SalesSeriesDataset(values, pstarts_train, HISTORY2, PRED_LEN),
+            CovariateSeriesDataset(values, cov, pstarts_train, HISTORY2, PRED_LEN),
             batch_size=BATCH_SIZE, shuffle=True,
         )
         dl_va = DataLoader(
-            SalesSeriesDataset(values, pstarts_val, HISTORY2, PRED_LEN),
+            CovariateSeriesDataset(values, cov, pstarts_val, HISTORY2, PRED_LEN),
             batch_size=1, shuffle=False,
         )
         dl_te = DataLoader(
-            SalesSeriesDataset(values, pstarts_test, HISTORY2, PRED_LEN),
+            CovariateSeriesDataset(values, cov, pstarts_test, HISTORY2, PRED_LEN),
             batch_size=1, shuffle=False,
         )
         dl_fin = DataLoader(
-            SalesSeriesDataset(values, np.array([final_origin_plot]), HISTORY2, PRED_LEN),
+            CovariateSeriesDataset(values, cov, np.array([final_origin_plot]), HISTORY2, PRED_LEN),
             batch_size=1, shuffle=False,
         )
 
